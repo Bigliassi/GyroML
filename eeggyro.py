@@ -36,7 +36,7 @@ SUBCHUNK_COUNT = 4             # How many sub-chunks per chunk
 BAYES_CALLS = 8                # Bayesian optimization calls
 RANDOM_SEED = 42
 
-# We'll do ± 20% tolerance around the half-cycle time from the user’s nominal RPM
+# We'll do ± 20% tolerance around the FULL cycle time from the user’s nominal RPM
 RPM_TOLERANCE = 0.2
 
 # Confidence threshold for final pass classification
@@ -86,15 +86,13 @@ def get_rpm():
 
 def compute_rpm_range(rpm, tolerance=RPM_TOLERANCE):
     """
-    The user’s RPM is for a FULL cycle (Left->Right->Left).
-    e.g. 60 RPM => 1.0 second per full cycle => half-cycle is 0.5s.
-    We'll do ± 'tolerance' around that half-cycle time.
+    The user’s RPM is for a FULL cycle (e.g., 60 RPM => ~1.0s).
+    We'll do ± 'tolerance' around that FULL cycle time.
     """
     full_cycle_sec = 60.0 / rpm
-    half_cycle_sec = full_cycle_sec / 2.0
-    min_time = half_cycle_sec*(1 - tolerance)
-    max_time = half_cycle_sec*(1 + tolerance)
-    logging.info(f"RPM={rpm}, half-cycle nominal={half_cycle_sec:.3f}s => range=({min_time:.3f}, {max_time:.3f})")
+    min_time = full_cycle_sec*(1 - tolerance)
+    max_time = full_cycle_sec*(1 + tolerance)
+    logging.info(f"RPM={rpm}, full-cycle nominal={full_cycle_sec:.3f}s => range=({min_time:.3f}, {max_time:.3f})")
     return (min_time, max_time)
 
 # -----------------------------------------------------------------------------
@@ -295,7 +293,7 @@ def xgboost_predict_proba(model, scaler, label_encoder, X, model_columns):
 
 import xgboost
 def dummy_xgb():
-    model= xgboost.XGBClassifier()
+    model= xgb.XGBClassifier()
     model.fit(np.zeros((2,2)), [0,1])
     le= LabelEncoder(); le.fit(["left","right"])
     sc= StandardScaler(); sc.fit(np.zeros((2,2)))
@@ -762,7 +760,7 @@ def run_detection_on_chunk(raw_data, fs, chunk_indices, params,
         peak_times.append((start_idx/fs)+ local_t[p])
 
     if not feats_list:
-        logging.debug("No features => 0 events.")
+        logging.debug("No features => no events.")
         return [],[],[]
 
     df_feat= pd.DataFrame(feats_list)
@@ -805,7 +803,7 @@ def main():
         fname= get_filename()
         full_path= os.path.abspath(fname)
 
-        # 2) Prompt for user RPM
+        # 2) Prompt for user RPM - now used as a FULL cycle time (not half)
         rpm_val= get_rpm()
         rpm_range= compute_rpm_range(rpm_val, tolerance=RPM_TOLERANCE)
 
@@ -883,7 +881,7 @@ def main():
                 best_score= -res.fun
                 logging.info(f"  => best params for chunk {i+1}: {best_params}, valid cyc={best_score}")
 
-                # final pass => only keep durations in rpm_range
+                # final pass => only keep durations in rpm_range (FULL cycle ~ e.g. 1.0s ± 20%)
                 c_evts, c_cyc, c_inv= run_detection_on_chunk(
                     data_copy, fs, (cstart,cend),
                     best_params,
@@ -928,7 +926,7 @@ def main():
             if 'start_time' in inv:
                 plt.axvspan(inv['start_time'], inv['end_time'], color='red', alpha=0.3)
 
-        plt.title(f"BEST COMBO={best_combo}, Found {best_cycles_count} cycles\n(RPM half-cycle range= {rpm_range} )")
+        plt.title(f"BEST COMBO={best_combo}, Found {best_cycles_count} cycles\n(RPM full-cycle range= {rpm_range} )")
         plt.xlabel("Time (s)")
         plt.ylabel("Signal Amplitude")
         plt.legend()
