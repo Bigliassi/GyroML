@@ -6,6 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import logging
 import warnings
+import multiprocessing
+from functools import partial
 
 import mne
 from scipy.signal import detrend
@@ -31,27 +33,31 @@ warnings.filterwarnings('ignore')
 # USER CONFIG
 # -----------------------------------------------------------------------------
 CHUNK_COUNT = 3                # Number of large time-based chunks
-SUBCHUNK_DURATION = 5.0        # Sub-chunk size in seconds
-SUBCHUNK_COUNT = 4             # How many sub-chunks per chunk
-BAYES_CALLS = 8                # Bayesian optimization calls
+SUBCHUNK_DURATION = 3.0        # Reduced from 5.0s to 3.0s for faster evaluation
+SUBCHUNK_COUNT = 3             # Reduced from 4 to 3 for faster evaluation
+BAYES_CALLS = 5                # Reduced from 8 to 5 for faster evaluation
 RANDOM_SEED = 42
 
-# We'll do ± 20% tolerance around the FULL cycle time from the user’s nominal RPM
+# We'll do ± 20% tolerance around the FULL cycle time from the user's nominal RPM
 RPM_TOLERANCE = 0.2
 
 # Confidence threshold for final pass classification
 CONFIDENCE_THRESHOLD = 0.5
 
 MAX_AXES_COMBO_SIZE = 2        # We'll test combos of up to 2 axes
-MAX_SNIPPET_ATTEMPTS = 5
-SNIPPET_SECONDS = 10.0
+MAX_SNIPPET_ATTEMPTS = 3       # Reduced from 5 to 3
+SNIPPET_SECONDS = 8.0          # Reduced from 10.0s to 8.0s
+
+# Early stopping criteria - abort a combination if it performs poorly
+MIN_EVENTS_AFTER_FIRST_CHUNK = 2  # Minimum events to continue after first chunk
+EARLY_STOP_THRESHOLD = 0.1      # Minimum validity score to continue processing
 
 ALL_AXES = ['GyroX','GyroY','GyroZ','AccelerX','AccelerY','AccelerZ']
 
 SEARCH_SPACE = [
-    Real(1e-4, 0.02, name='initial_threshold', prior='log-uniform'),
-    Real(0.5, 3.0, name='prominence_scale_factor', prior='log-uniform'),
-    Categorical([3, 5, 8], name='cutoff_frequency'),
+    Real(1e-4, 0.01, name='initial_threshold', prior='log-uniform'),  # Narrowed range
+    Real(0.8, 2.0, name='prominence_scale_factor', prior='log-uniform'),  # Narrowed range
+    Categorical([3, 5], name='cutoff_frequency'),  # Removed 8Hz option
     Categorical([False, True], name='use_wavelet')
 ]
 
@@ -104,7 +110,7 @@ def get_rpm():
 
 def compute_rpm_range(rpm, tolerance=RPM_TOLERANCE):
     """
-    The user’s RPM is for a FULL cycle (e.g., 60 RPM => ~1.0s).
+    The user's RPM is for a FULL cycle (e.g., 60 RPM => ~1.0s).
     We'll do ± 'tolerance' around that FULL cycle time.
     """
     full_cycle_sec = 60.0 / rpm
@@ -156,24 +162,171 @@ def apply_kalman_filter(signal):
     means, _ = kf.filter(signal)
     return means.flatten()
 
+# -----------------------------------------------------------------------------
+# CACHING
+# -----------------------------------------------------------------------------
+# Simple cache for expensive computations
+peak_detection_cache = {}
+preprocessing_cache = {}
+
+def clear_caches():
+    """Clear all caches when starting a new BDF file."""
+    global peak_detection_cache, preprocessing_cache
+    peak_detection_cache = {}
+    preprocessing_cache = {}
+
 def advanced_preprocessing(signal, fs,
                           use_wavelet=False,
                           wavelet_level=1,
                           polynomial_detrend=True,
                           cutoff_frequency=3):
+    """
+    Apply several advanced preprocessing techniques to the signal.
+    Uses caching to avoid redundant processing of identical signals.
+    """
     from scipy.signal import detrend as sp_detrend
+    
+    # Check for empty or invalid signals
     if len(signal) == 0:
         return signal
+        
+    # Hash the signal and parameters for caching
+    import hashlib
+    sig_hash = hashlib.md5(signal.tobytes()).hexdigest()
+    param_str = f"{use_wavelet}_{wavelet_level}_{polynomial_detrend}_{cutoff_frequency}"
+    cache_key = f"{sig_hash}_{param_str}"
+    
+    # Return cached result if available
+    if cache_key in preprocessing_cache:
+        return preprocessing_cache[cache_key]
+    
+    # Early performance optimization - use faster methods for longer signals
+    if len(signal) > 50000:
+        # For long signals, use optimized processing with downsampling for wavelet
+        if use_wavelet:
+            # Downsample for wavelet processing if signal is very long
+            downsample_factor = 2
+            if len(signal) > 100000:
+                downsample_factor = 4
+                
+            # Process wavelet on downsampled data
+            downsampled = signal[::downsample_factor]
+            denoised = wavelet_denoise(downsampled, level=wavelet_level)
+            # Resize back to original size
+            from scipy.interpolate import interp1d
+            x_orig = np.arange(len(signal))
+            x_down = np.linspace(0, len(signal)-1, len(downsampled))
+            f = interp1d(x_down, denoised, kind='linear', bounds_error=False, fill_value="extrapolate")
+            signal = f(x_orig)
+        
+        if polynomial_detrend:
+            signal = sp_detrend(signal, type='linear')
+            
+        # Optimize filter for long signals - use smaller order
+        signal = low_pass_filter(signal, cutoff_frequency, fs=fs, order=2)
+        
+        # Skip Kalman for very long signals (too computationally expensive)
+        if len(signal) < 100000:
+            # Use Kalman on subset of signal, then stitch back
+            step = len(signal) // 3
+            sig_parts = []
+            for i in range(0, len(signal), step):
+                chunk = signal[i:i+step]
+                chunk_filtered = apply_kalman_filter(chunk)
+                sig_parts.append(chunk_filtered)
+            signal = np.concatenate(sig_parts)
+    else:
+        # For shorter signals, use the full processing pipeline
+        if use_wavelet:
+            signal = wavelet_denoise(signal, level=wavelet_level)
 
-    if use_wavelet:
-        signal = wavelet_denoise(signal, level=wavelet_level)
+        if polynomial_detrend:
+            signal = sp_detrend(signal, type='linear')
 
-    if polynomial_detrend:
-        signal = sp_detrend(signal, type='linear')
-
-    signal = low_pass_filter(signal, cutoff_frequency, fs=fs)
-    signal = apply_kalman_filter(signal)
+        signal = low_pass_filter(signal, cutoff_frequency, fs=fs)
+        signal = apply_kalman_filter(signal)
+    
+    # Cache the result
+    preprocessing_cache[cache_key] = signal
     return signal
+
+def adaptive_peak_detection(signal, fs,
+                           initial_threshold,
+                           prominence_scale_factor):
+    """
+    Detect peaks with adaptive thresholding.
+    Uses caching to avoid redundant processing of identical signals.
+    """
+    from scipy.signal import find_peaks
+    
+    # Check for empty signal
+    if len(signal) == 0:
+        return np.array([], dtype=int)
+    
+    # Hash the signal and parameters for caching
+    import hashlib
+    sig_hash = hashlib.md5(signal.tobytes()).hexdigest()
+    param_str = f"{initial_threshold}_{prominence_scale_factor}"
+    cache_key = f"{sig_hash}_{param_str}"
+    
+    # Return cached result if available
+    if cache_key in peak_detection_cache:
+        return peak_detection_cache[cache_key]
+    
+    # Optimize minimum distance between peaks based on sampling rate and expected cycle time
+    dist = int(0.7 * fs)
+    
+    # Use a faster method for rolling statistics on large signals
+    if len(signal) > 50000:
+        # Use a smaller window size for efficiency
+        window_size = min(500, len(signal) // 100)
+        window_size = max(window_size, 10)  # ensure minimum size
+        
+        # Use numpy's rolling window operation directly
+        def rolling_std_numpy(arr, w):
+            shape = arr.shape[:-1] + (arr.shape[-1] - w + 1, w)
+            strides = arr.strides + (arr.strides[-1],)
+            windows = np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
+            return np.std(windows, axis=-1)
+            
+        # Pad to handle edge effects
+        padded = np.pad(signal, (window_size//2, window_size//2), mode='edge')
+        # Calculate rolling std
+        std_vals = rolling_std_numpy(padded, window_size)
+        # Match the original signal length
+        rolling_std = np.zeros_like(signal)
+        padding = max(0, len(signal) - len(std_vals))
+        if padding > 0:
+            rolling_std[:len(std_vals)] = std_vals
+            rolling_std[len(std_vals):] = std_vals[-1]
+        else:
+            rolling_std = std_vals[:len(signal)]
+    else:
+        # For smaller signals, use pandas rolling method
+        rolling_std = pd.Series(signal).rolling(window=500, center=True, min_periods=1).std()
+        rolling_std = rolling_std.fillna(method='bfill').fillna(method='ffill').values
+    
+    # Adaptive threshold based on local signal statistics
+    local_arr = initial_threshold + (prominence_scale_factor * rolling_std)
+    global_thr = np.median(local_arr)
+    
+    # For very long signals, use a divide-and-conquer approach to peak finding
+    if len(signal) > 100000:
+        chunk_size = 50000
+        all_peaks = []
+        for i in range(0, len(signal), chunk_size):
+            chunk = signal[i:min(i+chunk_size, len(signal))]
+            chunk_peaks, _ = find_peaks(chunk, prominence=global_thr, distance=dist)
+            all_peaks.append(chunk_peaks + i)  # adjust peak indices
+        peaks = np.concatenate(all_peaks) if all_peaks else np.array([], dtype=int)
+    else:
+        peaks, _ = find_peaks(signal, prominence=global_thr, distance=dist)
+    
+    logging.debug(f"Adaptive peaks found: {len(peaks)} with threshold={global_thr:.5f}, dist={dist}")
+    
+    # Cache the result
+    peak_detection_cache[cache_key] = peaks
+    return peaks
 
 def vector_magnitude(x, y, z):
     return np.sqrt(x**2 + y**2 + z**2)
@@ -181,19 +334,6 @@ def vector_magnitude(x, y, z):
 # -----------------------------------------------------------------------------
 # PEAK DETECTION & FEATURES
 # -----------------------------------------------------------------------------
-def adaptive_peak_detection(signal, fs,
-                            initial_threshold,
-                            prominence_scale_factor):
-    from scipy.signal import find_peaks
-    dist = int(0.7 * fs)
-    rolling_std = pd.Series(signal).rolling(window=500, center=True, min_periods=1).std()
-    rolling_std = rolling_std.fillna(method='bfill').fillna(method='ffill').values
-    local_arr = initial_threshold + (prominence_scale_factor * rolling_std)
-    global_thr = np.median(local_arr)
-    peaks, _ = find_peaks(signal, prominence=global_thr, distance=dist)
-    logging.debug(f"Adaptive peaks found: {len(peaks)} with threshold={global_thr:.5f}, dist={dist}")
-    return np.array(peaks, dtype=int)
-
 def extract_features(signal_segments, time_segment):
     feats = {}
     for axis, seg in signal_segments.items():
@@ -623,6 +763,10 @@ def create_compound_signal_for_combo(data_copy, combo_name='CompoundSignal', axe
         return
     squares = []
     for ax in axes:
+        # Skip this combo if any axis has NaN or inf values
+        if np.any(np.isnan(data_copy[ax])) or np.any(np.isinf(data_copy[ax])):
+            logging.warning(f"Combo {axes} => axis {ax} contains NaN or inf values, skipping compound.")
+            return
         squares.append(data_copy[ax]**2)
     sumsq = np.sum(squares, axis=0)
     magnitude = np.sqrt(sumsq)
@@ -683,104 +827,93 @@ def bayes_objective(params, raw_data, fs, subchunks):
     """
     Bayesian objective => we do a short detection to see how many L->R pairs
     appear (heuristically, ignoring the final RPM-based range).
-    We maximize (# of cycles).
+    We maximize (# of cycles). Includes early stopping for efficiency.
     """
     (init_thr, prom_scale, cutoff_freq, use_wav) = params
     total_valid = 0
+    
+    # Early stopping mechanism - if we've found enough cycles, return early
+    early_stop_threshold = 10  # If we find this many cycles, it's good enough
+    
     for (st, ed) in subchunks:
         evs, cyc = detect_peaks_and_cycles_heuristic(raw_data, fs, st, ed,
-                                                     init_thr, prom_scale,
-                                                     cutoff_freq, use_wav)
+                                                    init_thr, prom_scale,
+                                                    cutoff_freq, use_wav)
         total_valid += len(cyc)
+        
+        # If we've already found enough cycles, stop early
+        if total_valid >= early_stop_threshold:
+            logging.debug(f"Found {total_valid} cycles, early stopping Bayes evaluation")
+            break
+    
     return -total_valid
 
 def detect_peaks_and_cycles_heuristic(raw_data, fs,
-                                      start_idx, end_idx,
-                                      init_thr, prom_scale,
-                                      cutoff_freq, use_wav):
-    seg_data = {}
-    for ch in raw_data:
-        seg = raw_data[ch][start_idx:end_idx]
-        imp = SimpleImputer(strategy='mean')
-        seg_imp = imp.fit_transform(seg.reshape(-1,1)).ravel()
-        proc = advanced_preprocessing(seg_imp, fs=fs,
-                                      use_wavelet=use_wav,
-                                      cutoff_frequency=cutoff_freq)
-        seg_data[ch] = proc
-
-    detect_key = pick_detection_axis(seg_data)
-    if not detect_key:
+                                     start_idx, end_idx,
+                                     init_thr, prom_scale,
+                                     cutoff_freq, use_wav):
+    """
+    Optimized version of peak detection for Bayesian optimization.
+    Uses simpler processing for speed.
+    """
+    # Use minimal preprocessing for speed in the Bayesian process
+    detect_key = 'CompoundSignal' if 'CompoundSignal' in raw_data else next(iter(raw_data.keys()))
+    
+    # Extract just the segment we need
+    seg = raw_data[detect_key][start_idx:end_idx]
+    
+    if len(seg) < 2:
         return [], []
-
-    slen = len(seg_data[detect_key])
-    if slen < 2:
+    
+    # Use simple preprocessing for speed
+    if np.any(np.isnan(seg)) or np.any(np.isinf(seg)):
+        seg = np.nan_to_num(seg, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Fast low-pass filter
+    from scipy.signal import butter, filtfilt
+    nyquist = 0.5 * fs
+    norm_cut = cutoff_freq / nyquist
+    b, a = butter(2, norm_cut, btype='low', analog=False)
+    proc = filtfilt(b, a, seg)
+    
+    local_t = np.arange(len(proc)) / fs
+    
+    # Fast peak detection
+    from scipy.signal import find_peaks
+    dist = int(0.7 * fs)
+    pks, _ = find_peaks(proc, prominence=init_thr, distance=dist)
+    
+    if len(pks) < 2:
         return [], []
-    local_t = np.arange(slen) / fs
-
-    pks = adaptive_peak_detection(seg_data[detect_key], fs=fs,
-                                  initial_threshold=init_thr,
-                                  prominence_scale_factor=prom_scale)
-    if len(pks) == 0:
-        return [], []
-
-    wsize = int(0.5 * fs)
-    feats_list = []
-    peak_times = []
-    for p in pks:
-        s0 = max(0, p - wsize)
-        s1 = min(slen, p + wsize)
-        subd = {ax: seg_data[ax][s0:s1] for ax in seg_data}
-        feats = extract_features(subd, local_t[s0:s1])
-        feats_list.append(feats)
-        peak_times.append((start_idx/fs) + local_t[p])
-
-    if not feats_list:
-        return [], []
-    df_feat = pd.DataFrame(feats_list)
-    if len(df_feat) > 1:
-        iso = IsolationForest(random_state=RANDOM_SEED)
-        outlbl = iso.fit_predict(df_feat)
-        inl = np.where(outlbl == 1)[0]
-        df_feat = df_feat.iloc[inl].reset_index(drop=True)
-        peak_times = np.array(peak_times)[inl]
-
-    if len(df_feat) == 0:
-        return [], []
-
-    # heuristic labeling
-    labs = []
-    for i in range(len(df_feat)):
-        mgx = df_feat.get('mean_GyroX', 0)[i]
-        mgy = df_feat.get('mean_GyroY', 0)[i]
-        if mgx > 0 and mgy > 0:
-            labs.append('left')
-        elif mgx < 0 and mgy < 0:
-            labs.append('right')
-        else:
-            if abs(mgx) > abs(mgy):
-                labs.append('left' if mgx > 0 else 'right')
-            else:
-                labs.append('left' if mgy > 0 else 'right')
-
+    
+    # Simplified labeling - alternate left/right for speed
     events = []
-    for i, lb in enumerate(labs):
-        events.append({
-            'time': peak_times[i],
-            'movement': lb.capitalize()+" Head Movement"
-        })
-    cor = enforce_alternating_movements(events)
-
-    # define cycles as all L->R pairs (no range check here)
+    for i, p in enumerate(pks):
+        time_val = (start_idx/fs) + local_t[p]
+        if i % 2 == 0:
+            events.append({
+                'time': time_val,
+                'movement': "Left Head Movement"
+            })
+        else:
+            events.append({
+                'time': time_val,
+                'movement': "Right Head Movement"
+            })
+    
+    # Define cycles as all L->R pairs (simplified for speed)
     cyc = []
     i = 0
-    while i < len(cor) - 1:
-        e1 = cor[i]
-        e2 = cor[i+1]
+    while i < len(events) - 1:
+        e1 = events[i]
+        e2 = events[i+1]
         if e1['movement'].startswith('Left') and e2['movement'].startswith('Right'):
             cyc.append({'start_time': e1['time'], 'end_time': e2['time']})
+            i += 2
+        else:
             i += 1
-        i += 1
-    return cor, cyc
+    
+    return events, cyc
 
 # -----------------------------------------------------------------------------
 # FINAL PASS
@@ -790,87 +923,157 @@ def run_detection_on_chunk(raw_data, fs, chunk_indices, params,
                            rpm_range):
     from sklearn.impute import SimpleImputer
     (start_idx, end_idx) = chunk_indices
-    seg_data = {}
-    for ch in raw_data:
-        seg = raw_data[ch][start_idx:end_idx]
-        imp = SimpleImputer(strategy='mean')
-        seg_imp = imp.fit_transform(seg.reshape(-1,1)).ravel()
-        proc = advanced_preprocessing(seg_imp, fs=fs,
-                                      use_wavelet=params['use_wavelet'],
-                                      cutoff_frequency=params['cutoff_frequency'])
-        seg_data[ch] = proc
+    
+    try:
+        # Handle edge cases
+        if start_idx >= end_idx or start_idx < 0:
+            logging.warning(f"Invalid chunk indices: {start_idx}:{end_idx}")
+            return [], [], []
+            
+        seg_data = {}
+        for ch in raw_data:
+            try:
+                seg = raw_data[ch][start_idx:end_idx]
+                # Handle empty segments
+                if len(seg) == 0:
+                    logging.warning(f"Empty segment for channel {ch}")
+                    continue
+                    
+                # Check for NaN/inf in raw data
+                if np.any(np.isnan(seg)) or np.any(np.isinf(seg)):
+                    logging.warning(f"Channel {ch} contains NaN or inf values, applying filter")
+                    # Replace NaN/inf with segment mean or zeros if all NaN/inf
+                    if np.all(np.isnan(seg)) or np.all(np.isinf(seg)):
+                        seg = np.zeros_like(seg)
+                    else:
+                        mean_val = np.nanmean(seg[~np.isinf(seg)])
+                        seg = np.nan_to_num(seg, nan=mean_val, posinf=mean_val, neginf=-mean_val)
+                        
+                imp = SimpleImputer(strategy='mean')
+                seg_imp = imp.fit_transform(seg.reshape(-1,1)).ravel()
+                proc = advanced_preprocessing(seg_imp, fs=fs,
+                                          use_wavelet=params['use_wavelet'],
+                                          cutoff_frequency=params['cutoff_frequency'])
+                seg_data[ch] = proc
+            except Exception as e:
+                logging.warning(f"Error processing channel {ch}: {str(e)}")
+                continue
 
-    detect_key = pick_detection_axis(seg_data)
-    if not detect_key:
-        logging.debug("No valid detection axis => 0 events.")
+        if not seg_data:
+            logging.debug("No valid segments could be processed")
+            return [], [], []
+
+        detect_key = pick_detection_axis(seg_data)
+        if not detect_key:
+            logging.debug("No valid detection axis => 0 events.")
+            return [], [], []
+
+        slen = len(seg_data[detect_key])
+        if slen < 2:
+            logging.debug(f"Signal too short: {slen} samples")
+            return [], [], []
+            
+        local_t = np.arange(slen) / fs
+        
+        try:
+            pks = adaptive_peak_detection(seg_data[detect_key], fs=fs,
+                                      initial_threshold=params['initial_threshold'],
+                                      prominence_scale_factor=params['prominence_scale_factor'])
+        except Exception as e:
+            logging.warning(f"Peak detection failed: {str(e)}")
+            return [], [], []
+            
+        logging.debug(f"Chunk detection => found {len(pks)} peaks.")
+        if len(pks) == 0:
+            return [], [], []
+
+        wsize = int(0.5 * fs)
+        feats_list = []
+        peak_times = []
+        for p in pks:
+            try:
+                s0 = max(0, p - wsize)
+                s1 = min(slen, p + wsize)
+                subd = {ax: seg_data[ax][s0:s1] for ax in seg_data}
+                feats = extract_features(subd, local_t[s0:s1])
+                feats_list.append(feats)
+                peak_times.append((start_idx/fs) + local_t[p])
+            except Exception as e:
+                logging.warning(f"Error extracting features for peak at {p}: {str(e)}")
+                continue
+
+        if not feats_list:
+            logging.debug("No features => no events.")
+            return [], [], []
+
+        df_feat = pd.DataFrame(feats_list)
+        
+        # Apply IsolationForest only if enough samples
+        if len(df_feat) > 2:
+            try:
+                iso = IsolationForest(random_state=RANDOM_SEED)
+                outlbl = iso.fit_predict(df_feat)
+                inl = np.where(outlbl == 1)[0]
+                df_feat = df_feat.iloc[inl].reset_index(drop=True)
+                peak_times = np.array(peak_times)[inl]
+            except Exception as e:
+                logging.warning(f"IsolationForest failed: {str(e)}")
+                # Continue with original data if isolation forest fails
+
+        if len(df_feat) == 0:
+            logging.debug("All peaks outliers => 0 events.")
+            return [], [], []
+
+        try:
+            pred_lbl, confs = xgboost_predict_proba(xgb_model, xgb_scaler, xgb_le, df_feat, model_columns)
+        except Exception as e:
+            logging.warning(f"XGBoost prediction failed: {str(e)}")
+            return [], [], []
+            
+        if len(pred_lbl) == 0:
+            logging.debug("No predictions returned => skip.")
+            return [], [], []
+
+        # Filter by confidence
+        accepted_idx = np.where(confs >= CONFIDENCE_THRESHOLD)[0]
+        logging.debug(f"XGBoost => total events={len(pred_lbl)}, accepted={len(accepted_idx)} (conf>= {CONFIDENCE_THRESHOLD})")
+
+        events = []
+        for i in range(len(pred_lbl)):
+            logging.debug(f" event{i} => label={pred_lbl[i]}, conf={confs[i]:.3f}")
+
+        for i in accepted_idx:
+            lb = pred_lbl[i]
+            events.append({
+                'time': peak_times[i],
+                'movement': lb.capitalize()+" Head Movement"
+            })
+
+        cor = enforce_alternating_movements(events)
+        cyc, inv = detect_cycles_rpm(cor, rpm_range)
+        logging.debug(f"Final chunk => events={len(events)}, cycles={len(cyc)}, invalid={len(inv)}")
+        return events, cyc, inv
+        
+    except Exception as e:
+        logging.error(f"Unexpected error in run_detection_on_chunk: {str(e)}")
         return [], [], []
 
-    slen = len(seg_data[detect_key])
-    local_t = np.arange(slen) / fs
-    pks = adaptive_peak_detection(seg_data[detect_key], fs=fs,
-                                  initial_threshold=params['initial_threshold'],
-                                  prominence_scale_factor=params['prominence_scale_factor'])
-    logging.debug(f"Chunk detection => found {len(pks)} peaks.")
-    if len(pks) == 0:
-        return [], [], []
-
-    wsize = int(0.5 * fs)
-    feats_list = []
-    peak_times = []
-    for p in pks:
-        s0 = max(0, p - wsize)
-        s1 = min(slen, p + wsize)
-        subd = {ax: seg_data[ax][s0:s1] for ax in seg_data}
-        feats = extract_features(subd, local_t[s0:s1])
-        feats_list.append(feats)
-        peak_times.append((start_idx/fs) + local_t[p])
-
-    if not feats_list:
-        logging.debug("No features => no events.")
-        return [], [], []
-
-    df_feat = pd.DataFrame(feats_list)
-    if len(df_feat) > 1:
-        iso = IsolationForest(random_state=RANDOM_SEED)
-        outlbl = iso.fit_predict(df_feat)
-        inl = np.where(outlbl == 1)[0]
-        df_feat = df_feat.iloc[inl].reset_index(drop=True)
-        peak_times = np.array(peak_times)[inl]
-
-    if len(df_feat) == 0:
-        logging.debug("All peaks outliers => 0 events.")
-        return [], [], []
-
-    pred_lbl, confs = xgboost_predict_proba(xgb_model, xgb_scaler, xgb_le, df_feat, model_columns)
-    if len(pred_lbl) == 0:
-        logging.debug("No predictions returned => skip.")
-        return [], [], []
-
-    # Filter by confidence
-    accepted_idx = np.where(confs >= CONFIDENCE_THRESHOLD)[0]
-    logging.debug(f"XGBoost => total events={len(pred_lbl)}, accepted={len(accepted_idx)} (conf>= {CONFIDENCE_THRESHOLD})")
-
-    events = []
-    for i in range(len(pred_lbl)):
-        logging.debug(f" event{i} => label={pred_lbl[i]}, conf={confs[i]:.3f}")
-
-    for i in accepted_idx:
-        lb = pred_lbl[i]
-        events.append({
-            'time': peak_times[i],
-            'movement': lb.capitalize()+" Head Movement"
-        })
-
-    cor = enforce_alternating_movements(events)
-    cyc, inv = detect_cycles_rpm(cor, rpm_range)
-    logging.debug(f"Final chunk => events={len(events)}, cycles={len(cyc)}, invalid={len(inv)}")
-    return events, cyc, inv
+def run_detection_on_chunk_with_multiprocessing(args):
+    """Helper function for multiprocessing"""
+    raw_data, fs, chunk_indices, params, xgb_model, xgb_le, xgb_scaler, model_columns, rpm_range = args
+    return run_detection_on_chunk(
+        raw_data, fs, chunk_indices, params, 
+        xgb_model, xgb_le, xgb_scaler, model_columns, rpm_range
+    )
 
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 def main():
     try:
+        # Clear caches at the start
+        clear_caches()
+        
         # 1) Prompt for BDF
         fname = get_filename()
         full_path = os.path.abspath(fname)
@@ -885,6 +1088,17 @@ def main():
             logging.error("No valid gyro/accel channels => abort.")
             return
 
+        # Detect and fix any NaN or inf values in the raw data
+        for ch in raw_data:
+            if np.any(np.isnan(raw_data[ch])) or np.any(np.isinf(raw_data[ch])):
+                logging.warning(f"Channel {ch} contains NaN/inf values, applying correction")
+                if np.all(np.isnan(raw_data[ch])) or np.all(np.isinf(raw_data[ch])):
+                    logging.warning(f"Channel {ch} is completely invalid, setting to zeros")
+                    raw_data[ch] = np.zeros_like(raw_data[ch])
+                else:
+                    mean_val = np.nanmean(raw_data[ch][~np.isinf(raw_data[ch])])
+                    raw_data[ch] = np.nan_to_num(raw_data[ch], nan=mean_val, posinf=mean_val, neginf=-mean_val)
+
         # snippet detection => log auto-range
         snippet_evts = snippet_detect_events(raw_data, fs, SNIPPET_SECONDS)
         if snippet_evts:
@@ -892,20 +1106,95 @@ def main():
         else:
             logging.debug("snippet_detect_events => no events found.")
 
-        # build combos
+        # Intelligently build and prioritize axes combinations
         import copy
-        combo_list = []
-        for r in range(1, MAX_AXES_COMBO_SIZE+1):
-            for combo in itertools.combinations(ALL_AXES, r):
-                if all(ax in raw_data for ax in combo):
-                    combo_list.append(combo)
-        logging.info(f"Axis combos to test: {combo_list}")
+        basic_combos = []
+        advanced_combos = []
+        
+        # First test single axes to find promising ones
+        single_axes_results = {}
+        
+        # Test each individual axis first to prioritize
+        for ax in ALL_AXES:
+            if ax in raw_data:
+                logging.info(f"\n===== Quick evaluation of axis: {ax} =====")
+                # Only test on a small snippet to gauge potential
+                data_copy = copy.deepcopy(raw_data)
+                ch_name = ax
+                total_len = len(data_copy[ch_name])
+                seg_len = int(SNIPPET_SECONDS * fs)
+                
+                if seg_len >= total_len:
+                    st = 0
+                    ed = total_len
+                else:
+                    max_st = total_len - seg_len
+                    random.seed(RANDOM_SEED)
+                    st = random.randint(0, max_st)
+                    ed = st + seg_len
+                
+                snippet = {}
+                snippet[ax] = data_copy[ax][st:ed]
+                # Apply simple preprocessing
+                imp = SimpleImputer(strategy='mean')
+                snippet[ax] = imp.fit_transform(snippet[ax].reshape(-1,1)).ravel()
+                snippet[ax] = low_pass_filter(snippet[ax], 5, fs)
+                
+                # Quick peak detection
+                try:
+                    pks = adaptive_peak_detection(snippet[ax], fs=fs, 
+                                                initial_threshold=0.005,
+                                                prominence_scale_factor=1.5)
+                    single_axes_results[ax] = len(pks)
+                    logging.info(f"  => Quick assessment of {ax}: found {len(pks)} potential peaks")
+                except Exception as e:
+                    logging.warning(f"  => Quick assessment of {ax} failed: {str(e)}")
+                    single_axes_results[ax] = 0
+        
+        # Sort axes by their potential (number of peaks found)
+        sorted_axes = sorted(single_axes_results.keys(), 
+                           key=lambda x: single_axes_results[x], 
+                           reverse=True)
+        
+        logging.info(f"Prioritized axes order: {sorted_axes}")
+        
+        # Build smart combinations
+        # Start with top 3 individual axes
+        for ax in sorted_axes[:3]:
+            basic_combos.append((ax,))
+        
+        # Then pairs of top performers
+        for i, ax1 in enumerate(sorted_axes[:3]):
+            for ax2 in sorted_axes[i+1:3]: # only combining top axes
+                if ax1.startswith('Gyro') and ax2.startswith('Gyro'):
+                    basic_combos.append((ax1, ax2))
+                elif ax1.startswith('Acceler') and ax2.startswith('Acceler'):
+                    basic_combos.append((ax1, ax2))
+        
+        # If requested, add more sophisticated combinations
+        if MAX_AXES_COMBO_SIZE >= 2:
+            # Some cross-type combos (gyro + accel)
+            top_gyros = [ax for ax in sorted_axes[:2] if ax.startswith('Gyro')]
+            top_accels = [ax for ax in sorted_axes[:2] if ax.startswith('Acceler')]
+            
+            for g in top_gyros:
+                for a in top_accels:
+                    advanced_combos.append((g, a))
+        
+        # Final combo list - start with basic combos, then add advanced if needed
+        combo_list = basic_combos + advanced_combos
+        logging.info(f"Smart axis combos to test: {combo_list}")
 
         best_combo = None
         best_cycles_count = 0
         best_cycles = []
         best_invalid = []
         best_data_for_plot = None
+        best_events = []
+
+        # Determine how many processes to use (up to number of CPUs, but at least 1)
+        num_processes = min(multiprocessing.cpu_count(), max(1, len(combo_list)))
+        logging.info(f"Using {num_processes} processes for parallel processing")
 
         # Evaluate combos
         for combo in combo_list:
@@ -914,6 +1203,11 @@ def main():
 
             # create "CompoundSignal" from these axes
             create_compound_signal_for_combo(data_copy, 'CompoundSignal', combo)
+            
+            # If CompoundSignal wasn't created, skip this combo
+            if 'CompoundSignal' not in data_copy:
+                logging.warning(f"Could not create compound signal for {combo}, skipping")
+                continue
 
             # snippet-based XGBoost
             xgb_model, xgb_le, xgb_scaler, model_cols = build_balanced_xgb_model(
@@ -927,9 +1221,14 @@ def main():
             combo_cycles = []
             combo_invalid = []
             combo_events = []
+            continue_processing = True
 
-            # chunk-based approach
+            # Process chunks - with early stopping
             for i, (cstart, cend) in enumerate(big_chunks):
+                if not continue_processing:
+                    logging.info(f"Stopping early for combo {combo} due to poor performance")
+                    break
+                    
                 logging.info(f" [Combo {combo}, chunk {i+1}/{CHUNK_COUNT} => {cstart}:{cend}]")
                 subs = sample_subchunks(cstart, cend, fs, SUBCHUNK_DURATION, SUBCHUNK_COUNT)
 
@@ -952,16 +1251,55 @@ def main():
                 best_score = -res.fun
                 logging.info(f"  => best params for chunk {i+1}: {best_params}, valid cyc={best_score}")
 
-                # final pass => only keep durations in rpm_range
-                c_evts, c_cyc, c_inv = run_detection_on_chunk(
-                    data_copy, fs, (cstart, cend),
-                    best_params,
-                    xgb_model, xgb_le, xgb_scaler, model_cols,
-                    rpm_range
-                )
-                combo_events.extend(c_evts)
-                combo_cycles.extend(c_cyc)
-                combo_invalid.extend(c_inv)
+                # Process large chunk in parallel if possible
+                if num_processes > 1:
+                    # Split the chunk into sub-chunks for parallel processing
+                    subchunk_size = (cend - cstart) // num_processes
+                    sub_chunks = []
+                    for j in range(num_processes):
+                        sub_start = cstart + j * subchunk_size
+                        sub_end = cstart + (j+1) * subchunk_size if j < num_processes-1 else cend
+                        sub_chunks.append((sub_start, sub_end))
+                    
+                    # Prepare arguments for parallel processing
+                    args_list = [(data_copy, fs, sub_chunk, best_params, 
+                                 xgb_model, xgb_le, xgb_scaler, model_cols, rpm_range)
+                                for sub_chunk in sub_chunks]
+                    
+                    # Process in parallel
+                    with multiprocessing.Pool(processes=num_processes) as pool:
+                        results = pool.map(run_detection_on_chunk_with_multiprocessing, args_list)
+                    
+                    # Combine results
+                    for c_evts, c_cyc, c_inv in results:
+                        combo_events.extend(c_evts)
+                        combo_cycles.extend(c_cyc)
+                        combo_invalid.extend(c_inv)
+                else:
+                    # Sequential processing if only one process
+                    c_evts, c_cyc, c_inv = run_detection_on_chunk(
+                        data_copy, fs, (cstart, cend),
+                        best_params,
+                        xgb_model, xgb_le, xgb_scaler, model_cols,
+                        rpm_range
+                    )
+                    combo_events.extend(c_evts)
+                    combo_cycles.extend(c_cyc)
+                    combo_invalid.extend(c_inv)
+                
+                # Early stopping after first chunk if performance is too poor
+                if i == 0 and len(c_cyc) < MIN_EVENTS_AFTER_FIRST_CHUNK:
+                    logging.info(f"  => Poor first chunk performance ({len(c_cyc)} cycles) => skipping remaining chunks")
+                    continue_processing = False
+                    continue
+                
+                # Early stopping if validity score is too low
+                total_events = len(combo_cycles) + len(combo_invalid)
+                if total_events > 0:
+                    validity = len(combo_cycles) / total_events
+                    if validity < EARLY_STOP_THRESHOLD:
+                        logging.info(f"  => Low validity score ({validity:.3f}) => skipping remaining chunks")
+                        continue_processing = False
 
             cyc_count = len(combo_cycles)
             logging.info(f" [COMBO={combo}] => final cycles= {cyc_count}")
@@ -971,6 +1309,7 @@ def main():
                 best_cycles = combo_cycles
                 best_invalid = combo_invalid
                 best_data_for_plot = data_copy
+                best_events = combo_events
 
         logging.info(f"\nBEST COMBO= {best_combo}, yield {best_cycles_count} cycles.")
 
@@ -1022,6 +1361,8 @@ def main():
 
     except Exception as e:
         logging.error(f"Error: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
 
 if __name__=="__main__":
     main()
