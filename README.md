@@ -73,6 +73,7 @@ Notes
 Ensure that your .bdf file includes correctly labeled gyroscope and accelerometer channels.
 The script assumes alternating left/right head movements and enforces this structure for cycle detection.
 It is optimized for large datasets and can skip low-performing signal segments.
+
 License
 
 This project is for research and educational use only.
